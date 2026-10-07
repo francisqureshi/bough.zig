@@ -1290,7 +1290,7 @@ pub const Verifier = struct {
     /// previously-pending chunk AND the just-pushed chunk simultaneously.
     released: [2][]u8 = .{ &.{}, &.{} },
 
-    /// True once EOF + root verification have completed. After this, `.read`
+    /// True once the declared content length and root have been verified. `.read`
     /// returns 0 once `released` drains.
     done: bool = false,
     /// Set on the empty-file path: nothing to read, just match the root.

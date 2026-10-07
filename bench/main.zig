@@ -51,6 +51,7 @@ fn verify(init: std.process.Init, args: []const [:0]const u8) !void {
     defer init.gpa.destroy(verifier);
     var dest: [65536]u8 = undefined;
     var first_ns: i96 = 0;
+    const cpu_start = std.Io.Clock.cpu_process.now(init.io).nanoseconds;
     const start = std.Io.Clock.awake.now(init.io).nanoseconds;
     for (0..repeats) |iteration| {
         var reader = std.Io.Reader.fixed(content);
@@ -67,8 +68,9 @@ fn verify(init: std.process.Init, args: []const [:0]const u8) !void {
         if (count != content.len) return error.WrongLength;
     }
     const elapsed = std.Io.Clock.awake.now(init.io).nanoseconds - start;
+    const cpu_ns = std.Io.Clock.cpu_process.now(init.io).nanoseconds - cpu_start;
     std.debug.print(
-        "{{\"bytes\":{d},\"elapsed_ns\":{d},\"first_read_ns\":{d},\"verifier_bytes\":{d}}}\n",
-        .{ content.len * repeats, elapsed, first_ns, @sizeOf(Bough.Verifier) },
+        "{{\"bytes\":{d},\"elapsed_ns\":{d},\"cpu_ns\":{d},\"first_read_ns\":{d},\"verifier_bytes\":{d}}}\n",
+        .{ content.len * repeats, elapsed, cpu_ns, first_ns, @sizeOf(Bough.Verifier) },
     );
 }
