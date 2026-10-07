@@ -2174,6 +2174,162 @@ test "verifiedSeek returns correct verified bytes" {
 
 // ---- streaming Verifier tests ----
 
+/// An unbuffered transport that fragments reads and can fail at a byte offset.
+const VerifierTestReader = struct {
+    reader: std.Io.Reader = .{
+        .vtable = &.{ .stream = stream },
+        .buffer = &.{},
+        .seek = 0,
+        .end = 0,
+    },
+    content: []const u8,
+    position: usize = 0,
+    fragment: usize = 4093,
+    fail_at: ?usize = null,
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @fieldParentPtr("reader", r);
+        if (self.fail_at) |offset| {
+            if (self.position >= offset) return error.ReadFailed;
+        }
+        if (self.position == self.content.len) return error.EndOfStream;
+        const end = @min(self.content.len, self.fail_at orelse self.content.len);
+        const n = try w.write(limit.sliceConst(self.content[self.position..@min(end, self.position + self.fragment)]));
+        self.position += n;
+        return n;
+    }
+};
+
+test "Verifier batch boundaries, fragmented input and repeated drains" {
+    const sizes = [_]usize{
+        0,                      1,                 chunk_length - 1,  chunk_length,          chunk_length + 1,
+        2 * chunk_length,       7 * chunk_length,  8 * chunk_length,  8 * chunk_length + 1,  9 * chunk_length,
+        9 * chunk_length + 17,  15 * chunk_length, 16 * chunk_length, 16 * chunk_length + 1, 17 * chunk_length,
+        17 * chunk_length + 63,
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, sizes[sizes.len - 1] + 1);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0x9b035eed);
+    random.random().bytes(content);
+    const dest = try testing.allocator.alloc(u8, chunk_length + 7);
+    defer testing.allocator.free(dest);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    for (sizes) |size| {
+        const root = try writeTestFileAndOutboard(io, tmp.dir, content[0..size]);
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        // The extra byte belongs to the next message, not this file.
+        var source: VerifierTestReader = .{ .content = content[0 .. size + 1] };
+        v.* = Verifier.init(io, &ob, &source.reader, root);
+        var position: usize = 0;
+        var iteration: usize = 0;
+        const drains = [_]usize{ 1, 17, 65536, chunk_length + 7 };
+        while (true) : (iteration += 1) {
+            const n = try v.read(dest[0..drains[iteration % drains.len]]);
+            if (n == 0) break;
+            try testing.expect(position + n <= size);
+            try testing.expectEqualSlices(u8, content[position..][0..n], dest[0..n]);
+            position += n;
+        }
+        try testing.expectEqual(size, position);
+        try testing.expectEqual(size, source.position);
+        try testing.expectEqual(@as(usize, 0), try v.read(dest));
+    }
+}
+
+test "Verifier never releases corrupt chunks across batches or final root" {
+    const size = 17 * chunk_length + 31;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0xa71b);
+    random.random().bytes(content);
+    const root = try writeTestFileAndOutboard(io, tmp.dir, content);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    // Every lane of both full batches, the pending chunk and the final tail.
+    for (0..18) |chunk_index| {
+        const offset = chunk_index * chunk_length;
+        content[offset] ^= 1;
+        defer content[offset] ^= 1;
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var source = std.Io.Reader.fixed(content);
+        v.* = Verifier.init(io, &ob, &source, root);
+        var dest: [4093]u8 = undefined;
+        var position: usize = 0;
+        while (true) {
+            const n = v.read(&dest) catch |err| {
+                // Even the final pair has a non-root parent in this tree.
+                try testing.expectEqual(error.ContentMismatch, err);
+                break;
+            };
+            try testing.expect(n > 0);
+            position += n;
+            // A pair is released together only after its parent matches.
+            try testing.expect(position <= (chunk_index / 2) * 2 * chunk_length);
+            try testing.expectEqualSlices(u8, content[position - n .. position], dest[0..n]);
+        }
+    }
+}
+
+test "Verifier proof failures, truncation and transport errors around batches" {
+    const size = 17 * chunk_length + 31;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0xefface);
+    random.random().bytes(content);
+    const root = try writeTestFileAndOutboard(io, tmp.dir, content);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    const out = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(out);
+    const cuts = [_]usize{ 0, 1, 2 * chunk_length, 8 * chunk_length - 1, 8 * chunk_length, 16 * chunk_length + 1, size - 1 };
+    for (cuts) |cut| {
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var short: VerifierTestReader = .{ .content = content[0..cut] };
+        v.* = Verifier.init(io, &ob, &short.reader, root);
+        try testing.expectError(error.UnexpectedEof, drainVerifier(v, out));
+        var failed: VerifierTestReader = .{ .content = content, .fail_at = cut };
+        v.* = Verifier.init(io, &ob, &failed.reader, root);
+        try testing.expectError(error.ReadFailed, drainVerifier(v, out));
+    }
+    const proof = try tmp.dir.openFile(io, "content.bao", .{ .mode = .read_write });
+    defer proof.close(io);
+    for ([_]u64{ 0, 6, 14, 15 }) |index| {
+        var original: [1]u8 = undefined;
+        try testing.expectEqual(@as(usize, 1), try proof.readPositionalAll(io, &original, 8 + index * 32));
+        try proof.writePositionalAll(io, &.{original[0] ^ 1}, 8 + index * 32);
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var source = std.Io.Reader.fixed(content);
+        v.* = Verifier.init(io, &ob, &source, root);
+        try testing.expectError(error.ContentMismatch, drainVerifier(v, out));
+        try proof.writePositionalAll(io, &original, 8 + index * 32);
+    }
+    var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+    defer ob.close();
+    var wrong_root = root;
+    wrong_root[0] ^= 1;
+    var source = std.Io.Reader.fixed(content);
+    v.* = Verifier.init(io, &ob, &source, wrong_root);
+    try testing.expectError(error.RootMismatch, drainVerifier(v, out));
+    try proof.setLength(io, 8);
+    source = .fixed(content);
+    v.* = Verifier.init(io, &ob, &source, root);
+    try testing.expectError(error.OutboardTruncated, drainVerifier(v, out));
+}
+
 /// Drive a Verifier to EOF, accumulating its output into `out_bytes` (which
 /// must be sized to the expected content length). Returns the total bytes
 /// emitted. Pulls into a small 1 KiB dest buffer to exercise multiple reads.
