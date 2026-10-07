@@ -35,4 +35,28 @@ Application code uses `const Bough = @import("bough.zig");`. The assembly links 
 
 To build this repo's native benchmark: `zig build bench -Doptimize=ReleaseFast -Dcpu=native -Dnative-kernel=true`.
 
+## Streaming verification
+
+`Verifier.init(io, outboard, content_reader, expected_root)` and `Verifier.read(dest)`
+verify sequential content using an existing outboard. Full non-final chunks are
+hashed in bounded SIMD batches, then checked against the outboard in file order.
+Single-chunk inputs, final chunks and incomplete SIMD groups use scalar hashing.
+The native backend hashes eight 256 KiB chunks at once; the portable backend uses
+the target's vector width up to eight lanes, falling back to one chunk for wider
+vectors. Hashes and the outboard format are unchanged.
+
+A verifier owns at most 2.25 MiB of payload buffers plus a few KiB of tree/hash
+state. Released bytes borrow those buffers, so storage stays bounded even with
+tiny caller buffers. Keep the verifier at a stable address after reading begins;
+budget `@sizeOf(Bough.Verifier)` per receive slot, using caller-owned heap or
+startup storage when the thread/coroutine stack is small. The verifier performs
+no allocations itself.
+
+Large inputs can read ahead by a full batch before returning the first bytes;
+smaller SIMD remainders retain chunk-at-a-time input reads. Bytes are released
+only after the existing outboard merge checks, with the final bytes held until
+the expected root matches. Whole-file acceptance still requires reading to
+successful completion; earlier returned bytes alone do not establish that the
+final root matches.
+
 See [optimization and 8-core/16-thread benchmarks](bench/SCALING.md), including the [original Rust comparison](bench/README.md).

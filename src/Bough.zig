@@ -1235,11 +1235,11 @@ pub fn verifiedSeek(
 // participated in at least one successful merge whose parent CV matched the
 // outboard (or, for the last chunk, after the root matched `expected_root`).
 //
-// Buffer cost: by the popcount invariant, at any point at most ONE stack entry
-// is a raw (not-yet-merged) chunk CV — always the top. So the verifier holds
-// at most one chunk_length worth of "unverified pending" bytes (256 KiB),
-// plus the chunk currently being filled (another 256 KiB), plus whatever is
-// in the `released` queue awaiting drain. Bound: ~768 KiB.
+// Buffer cost: one batch of at most eight chunks (2 MiB) plus one pending
+// raw chunk (256 KiB). The released queue borrows these buffers; it does not
+// allocate more storage. Hashes and tree state add a few KiB. A batch is never
+// overwritten until its hashes have been processed and its released bytes
+// drained. Smaller SIMD degrees use proportionally smaller batch buffers.
 // -----------------------------------------------------------------------------
 
 pub const VerifierError = error{
@@ -1253,6 +1253,10 @@ pub const VerifierError = error{
 };
 
 pub const Verifier = struct {
+    // A wider portable vector would exceed the buffer budget; use scalar
+    // chunks on such targets rather than buffering an unusable partial batch.
+    const batch_capacity = if (blake3.simd_degree <= 8) blake3.simd_degree else 1;
+
     io: std.Io,
     outboard: *OutboardReader,
     content_in: *std.Io.Reader,
@@ -1265,11 +1269,13 @@ pub const Verifier = struct {
     /// Post-order cursor into the outboard's parent-CV table.
     outboard_cursor: u64 = 0,
 
-    /// Counter for the chunk currently being filled from `content_in`.
+    /// Counter of the next chunk to enter the ordered proof checks.
     chunk_counter: u64 = 0,
-    /// How many bytes of the current chunk have been pulled from `content_in`.
-    cur_filled: usize = 0,
-    cur_buf: [blake3.chunk_length]u8 = undefined,
+    /// Contiguous input storage, also reused for the scalar final chunk.
+    batch_buf: [batch_capacity * blake3.chunk_length]u8 = undefined,
+    batch_hashes: [batch_capacity][8]u32 = undefined,
+    batch_count: usize = 0,
+    batch_index: usize = 0,
 
     /// Bytes of the topmost-on-stack RAW chunk CV — i.e., a chunk whose CV
     /// has been pushed onto the stack but not yet merged. By the popcount
@@ -1284,7 +1290,7 @@ pub const Verifier = struct {
     /// previously-pending chunk AND the just-pushed chunk simultaneously.
     released: [2][]u8 = .{ &.{}, &.{} },
 
-    /// True once EOF + root verification have completed. After this, `.read`
+    /// True once the declared content length and root have been verified. `.read`
     /// returns 0 once `released` drains.
     done: bool = false,
     /// Set on the empty-file path: nothing to read, just match the root.
@@ -1349,44 +1355,55 @@ pub const Verifier = struct {
         return null;
     }
 
-    /// Pull bytes from `content_in` into `cur_buf`. When a chunk closes (full
-    /// or final), compute its CV and process via either intermediate or final
-    /// path, which may populate `released`.
+    /// Read/hash a bounded batch, then advance its proof checks one chunk at
+    /// a time. `read` drains released slices before calling us again.
     fn pump(self: *Verifier) !void {
+        std.debug.assert(self.released[0].len == 0 and self.released[1].len == 0);
         const chunk = blake3.chunk_length;
-        // This chunk's final length: chunk_length, unless it's the tail.
-        const remaining_in_chunk_total: u64 = self.bytes_remaining + self.cur_filled;
-        const this_chunk_len: usize = @intCast(@min(@as(u64, chunk), remaining_in_chunk_total));
-
-        const want = this_chunk_len - self.cur_filled;
-        if (want > 0) {
-            const got = try self.content_in.readSliceShort(
-                self.cur_buf[self.cur_filled..this_chunk_len],
-            );
-            if (got == 0) return error.UnexpectedEof;
-            self.cur_filled += got;
+        if (self.batch_index == self.batch_count) {
+            // Reserve the final chunk, even when full: ROOT handling is scalar.
+            std.debug.assert(self.bytes_remaining > 0);
+            const full_chunks = (self.bytes_remaining - 1) / chunk;
+            // A partial SIMD batch is scalar anyway. Process it one chunk at
+            // a time to avoid extra read-ahead for small files and remainders.
+            const count: usize = if (full_chunks >= batch_capacity)
+                batch_capacity
+            else
+                @intCast(@min(1, full_chunks));
+            const len: usize = if (count == 0)
+                @intCast(self.bytes_remaining)
+            else
+                count * chunk;
+            const bytes = self.batch_buf[0..len];
+            // readSliceShort assembles fragmented reads, stopping only at EOF.
+            const got = try self.content_in.readSliceShort(bytes);
             self.bytes_remaining -= got;
-            if (self.cur_filled < this_chunk_len) return; // need more reads
+            if (got != len) return error.UnexpectedEof;
+            if (count == 0) {
+                try self.finaliseLastChunk(bytes);
+                return;
+            }
+            blake3.hashManyContiguous(
+                bytes,
+                self.chunk_counter,
+                blake3.iv,
+                self.batch_hashes[0..count],
+            );
+            self.batch_count = count;
+            self.batch_index = 0;
         }
-
-        // Chunk is full. Is it the last?
-        if (self.bytes_remaining == 0) {
-            try self.finaliseLastChunk();
-        } else {
-            try self.processIntermediateChunk();
-        }
+        const index = self.batch_index;
+        try self.processIntermediateChunk(
+            self.batch_buf[index * chunk ..][0..chunk],
+            self.batch_hashes[index],
+        );
+        self.batch_index += 1;
     }
 
-    /// Process a chunk that is known NOT to be the last. Hash, push, merge,
+    /// Process a chunk that is known NOT to be the last. Push, merge,
     /// and release bytes from any chunks whose CVs participated in a verified
     /// merge.
-    fn processIntermediateChunk(self: *Verifier) !void {
-        const cv = blake3.chunkHash(
-            self.cur_buf[0..self.cur_filled],
-            self.chunk_counter,
-            blake3.iv,
-            .{},
-        );
+    fn processIntermediateChunk(self: *Verifier, bytes: []u8, cv: [8]u32) !void {
         self.stack[self.stack_len] = cv;
         self.stack_len += 1;
 
@@ -1417,21 +1434,19 @@ pub const Verifier = struct {
             // then current (newer), preserving file order.
             if (self.pending_len > 0) {
                 self.released[0] = self.pending_buf[0..self.pending_len];
-                self.released[1] = self.cur_buf[0..self.cur_filled];
+                self.released[1] = bytes;
                 self.pending_len = 0;
             } else {
-                self.released[0] = self.cur_buf[0..self.cur_filled];
+                self.released[0] = bytes;
                 self.released[1] = &.{};
             }
-            self.cur_filled = 0;
         } else {
             // No merge: the just-pushed chunk is now the lone raw top. By
             // invariant, the previous pending must have been empty (a no-merge
             // push always follows a merge-bearing push or is the very first).
             std.debug.assert(self.pending_len == 0);
-            @memcpy(self.pending_buf[0..self.cur_filled], self.cur_buf[0..self.cur_filled]);
-            self.pending_len = self.cur_filled;
-            self.cur_filled = 0;
+            @memcpy(self.pending_buf[0..bytes.len], bytes);
+            self.pending_len = bytes.len;
         }
 
         self.chunk_counter += 1;
@@ -1442,24 +1457,24 @@ pub const Verifier = struct {
     /// flag on the final merge, comparing intermediate parents to the
     /// outboard and the root to `expected_root`. Release bytes (pending + last
     /// chunk) only after the root matches.
-    fn finaliseLastChunk(self: *Verifier) !void {
+    fn finaliseLastChunk(self: *Verifier, bytes: []u8) !void {
         const total_chunks = self.chunk_counter + 1;
 
         if (total_chunks == 1) {
             std.debug.assert(self.pending_len == 0);
             const cv = blake3.chunkHash(
-                self.cur_buf[0..self.cur_filled],
+                bytes,
                 0,
                 blake3.iv,
                 .{ .root = true },
             );
             const got = blake3.cvWordsToBytes(cv);
             if (!std.mem.eql(u8, &got, &self.expected_root)) return error.RootMismatch;
-            self.released[0] = self.cur_buf[0..self.cur_filled];
+            self.released[0] = bytes;
             self.released[1] = &.{};
         } else {
             var current = blake3.chunkHash(
-                self.cur_buf[0..self.cur_filled],
+                bytes,
                 self.chunk_counter,
                 blake3.iv,
                 .{},
@@ -1488,15 +1503,14 @@ pub const Verifier = struct {
             // Root verified — release pending (if any) then last chunk.
             if (self.pending_len > 0) {
                 self.released[0] = self.pending_buf[0..self.pending_len];
-                self.released[1] = self.cur_buf[0..self.cur_filled];
+                self.released[1] = bytes;
                 self.pending_len = 0;
             } else {
-                self.released[0] = self.cur_buf[0..self.cur_filled];
+                self.released[0] = bytes;
                 self.released[1] = &.{};
             }
         }
 
-        self.cur_filled = 0;
         self.done = true;
     }
 };
@@ -2173,6 +2187,215 @@ test "verifiedSeek returns correct verified bytes" {
 }
 
 // ---- streaming Verifier tests ----
+
+/// An unbuffered transport that fragments reads and can fail at a byte offset.
+const VerifierTestReader = struct {
+    reader: std.Io.Reader = .{
+        .vtable = &.{ .stream = stream },
+        .buffer = &.{},
+        .seek = 0,
+        .end = 0,
+    },
+    content: []const u8,
+    position: usize = 0,
+    fragment: usize = 4093,
+    fail_at: ?usize = null,
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @fieldParentPtr("reader", r);
+        if (self.fail_at) |offset| {
+            if (self.position >= offset) return error.ReadFailed;
+        }
+        if (self.position == self.content.len) return error.EndOfStream;
+        const end = @min(self.content.len, self.fail_at orelse self.content.len);
+        const n = try w.write(limit.sliceConst(self.content[self.position..@min(end, self.position + self.fragment)]));
+        self.position += n;
+        return n;
+    }
+};
+
+test "Verifier batch boundaries, fragmented input and repeated drains" {
+    const sizes = [_]usize{
+        0,                      1,                 chunk_length - 1,  chunk_length,          chunk_length + 1,
+        2 * chunk_length,       7 * chunk_length,  8 * chunk_length,  8 * chunk_length + 1,  9 * chunk_length,
+        9 * chunk_length + 17,  15 * chunk_length, 16 * chunk_length, 16 * chunk_length + 1, 17 * chunk_length,
+        17 * chunk_length + 63,
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, sizes[sizes.len - 1] + 1);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0x9b035eed);
+    random.random().bytes(content);
+    const dest = try testing.allocator.alloc(u8, chunk_length + 7);
+    defer testing.allocator.free(dest);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    for (sizes) |size| {
+        const root = try writeTestFileAndOutboard(io, tmp.dir, content[0..size]);
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        // The extra byte belongs to the next message, not this file.
+        var source: VerifierTestReader = .{ .content = content[0 .. size + 1] };
+        v.* = Verifier.init(io, &ob, &source.reader, root);
+        var position: usize = 0;
+        var iteration: usize = 0;
+        const drains = [_]usize{ 1, 17, 65536, chunk_length + 7 };
+        while (true) : (iteration += 1) {
+            const n = try v.read(dest[0..drains[iteration % drains.len]]);
+            if (n == 0) break;
+            try testing.expect(position + n <= size);
+            try testing.expectEqualSlices(u8, content[position..][0..n], dest[0..n]);
+            position += n;
+        }
+        try testing.expectEqual(size, position);
+        try testing.expectEqual(size, source.position);
+        try testing.expectEqual(@as(usize, 0), try v.read(dest));
+    }
+}
+
+test "Verifier never releases corrupt chunks across batches or final root" {
+    const size = 17 * chunk_length + 31;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0xa71b);
+    random.random().bytes(content);
+    const root = try writeTestFileAndOutboard(io, tmp.dir, content);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    // Every lane of both full batches, the pending chunk and the final tail.
+    for (0..18) |chunk_index| {
+        const offset = chunk_index * chunk_length;
+        content[offset] ^= 1;
+        defer content[offset] ^= 1;
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var source = std.Io.Reader.fixed(content);
+        v.* = Verifier.init(io, &ob, &source, root);
+        var dest: [4093]u8 = undefined;
+        var position: usize = 0;
+        while (true) {
+            const n = v.read(&dest) catch |err| {
+                // Even the final pair has a non-root parent in this tree.
+                try testing.expectEqual(error.ContentMismatch, err);
+                break;
+            };
+            try testing.expect(n > 0);
+            position += n;
+            // A pair is released together only after its parent matches.
+            try testing.expect(position <= (chunk_index / 2) * 2 * chunk_length);
+            try testing.expectEqualSlices(u8, content[position - n .. position], dest[0..n]);
+        }
+    }
+}
+
+test "Verifier proof failures, truncation and transport errors around batches" {
+    const size = 17 * chunk_length + 31;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0xefface);
+    random.random().bytes(content);
+    const root = try writeTestFileAndOutboard(io, tmp.dir, content);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    const out = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(out);
+    const cuts = [_]usize{ 0, 1, 2 * chunk_length, 8 * chunk_length - 1, 8 * chunk_length, 16 * chunk_length + 1, size - 1 };
+    for (cuts) |cut| {
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var short: VerifierTestReader = .{ .content = content[0..cut] };
+        v.* = Verifier.init(io, &ob, &short.reader, root);
+        try testing.expectError(error.UnexpectedEof, drainVerifier(v, out));
+        var failed: VerifierTestReader = .{ .content = content, .fail_at = cut };
+        v.* = Verifier.init(io, &ob, &failed.reader, root);
+        try testing.expectError(error.ReadFailed, drainVerifier(v, out));
+    }
+    const proof = try tmp.dir.openFile(io, "content.bao", .{ .mode = .read_write });
+    defer proof.close(io);
+    for ([_]u64{ 0, 6, 14, 15 }) |index| {
+        var original: [1]u8 = undefined;
+        try testing.expectEqual(@as(usize, 1), try proof.readPositionalAll(io, &original, 8 + index * 32));
+        try proof.writePositionalAll(io, &.{original[0] ^ 1}, 8 + index * 32);
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var source = std.Io.Reader.fixed(content);
+        v.* = Verifier.init(io, &ob, &source, root);
+        try testing.expectError(error.ContentMismatch, drainVerifier(v, out));
+        try proof.writePositionalAll(io, &original, 8 + index * 32);
+    }
+    var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+    defer ob.close();
+    var wrong_root = root;
+    wrong_root[0] ^= 1;
+    var source = std.Io.Reader.fixed(content);
+    v.* = Verifier.init(io, &ob, &source, wrong_root);
+    try testing.expectError(error.RootMismatch, drainVerifier(v, out));
+    try proof.setLength(io, 8);
+    source = .fixed(content);
+    v.* = Verifier.init(io, &ob, &source, root);
+    try testing.expectError(error.OutboardTruncated, drainVerifier(v, out));
+}
+
+test "Verifier drains before more input and withholds final bytes until root matches" {
+    try testing.expect(@sizeOf(Verifier) <= 9 * chunk_length + 4096);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const content = try testing.allocator.alloc(u8, 8 * chunk_length + 31);
+    defer testing.allocator.free(content);
+    var random = std.Random.DefaultPrng.init(0xd4a1);
+    random.random().bytes(content);
+    const v = try testing.allocator.create(Verifier);
+    defer testing.allocator.destroy(v);
+    // The final root gates either a pending/final pair or just the final chunk.
+    for ([_]usize{ 7 * chunk_length + 31, 8 * chunk_length + 31 }) |size| {
+        var root = try writeTestFileAndOutboard(io, tmp.dir, content[0..size]);
+        root[0] ^= 1;
+        var ob = try OutboardReader.open(io, tmp.dir, "content.bao");
+        defer ob.close();
+        var source: VerifierTestReader = .{ .content = content[0..size] };
+        v.* = Verifier.init(io, &ob, &source.reader, root);
+        var dest: [65536]u8 = undefined;
+        try testing.expectEqual(@as(usize, 0), try v.read(dest[0..0]));
+        try testing.expectEqual(@as(usize, 0), source.position);
+        try testing.expectEqual(@as(usize, 1), try v.read(dest[0..1]));
+        try testing.expectEqual(content[0], dest[0]);
+        const consumed = source.position;
+        const initial_chunks = if (size / chunk_length >= Verifier.batch_capacity)
+            @max(2, Verifier.batch_capacity)
+        else
+            2;
+        try testing.expectEqual(initial_chunks * chunk_length, consumed);
+        var position: usize = 1;
+        while (position < 2 * chunk_length) {
+            const n = try v.read(dest[0..@min(dest.len, 2 * chunk_length - position)]);
+            try testing.expect(n > 0);
+            try testing.expectEqual(consumed, source.position);
+            try testing.expectEqualSlices(u8, content[position..][0..n], dest[0..n]);
+            position += n;
+        }
+        const releasable = ((size / chunk_length) / 2) * 2 * chunk_length;
+        while (true) {
+            const n = v.read(&dest) catch |err| {
+                try testing.expectEqual(error.RootMismatch, err);
+                break;
+            };
+            try testing.expect(n > 0);
+            try testing.expect(position + n <= releasable);
+            try testing.expectEqualSlices(u8, content[position..][0..n], dest[0..n]);
+            position += n;
+        }
+        try testing.expectEqual(releasable, position);
+    }
+}
 
 /// Drive a Verifier to EOF, accumulating its output into `out_bytes` (which
 /// must be sized to the expected content length). Returns the total bytes
