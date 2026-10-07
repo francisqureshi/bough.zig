@@ -1371,22 +1371,19 @@ pub const Verifier = struct {
 
         // Chunk is full. Is it the last?
         if (self.bytes_remaining == 0) {
-            try self.finaliseLastChunk();
+            try self.finaliseLastChunk(self.cur_buf[0..self.cur_filled]);
         } else {
-            try self.processIntermediateChunk();
+            const bytes = self.cur_buf[0..self.cur_filled];
+            const cv = blake3.chunkHash(bytes, self.chunk_counter, blake3.iv, .{});
+            try self.processIntermediateChunk(bytes, cv);
         }
+        self.cur_filled = 0;
     }
 
-    /// Process a chunk that is known NOT to be the last. Hash, push, merge,
+    /// Process a chunk that is known NOT to be the last. Push, merge,
     /// and release bytes from any chunks whose CVs participated in a verified
     /// merge.
-    fn processIntermediateChunk(self: *Verifier) !void {
-        const cv = blake3.chunkHash(
-            self.cur_buf[0..self.cur_filled],
-            self.chunk_counter,
-            blake3.iv,
-            .{},
-        );
+    fn processIntermediateChunk(self: *Verifier, bytes: []u8, cv: [8]u32) !void {
         self.stack[self.stack_len] = cv;
         self.stack_len += 1;
 
@@ -1417,21 +1414,19 @@ pub const Verifier = struct {
             // then current (newer), preserving file order.
             if (self.pending_len > 0) {
                 self.released[0] = self.pending_buf[0..self.pending_len];
-                self.released[1] = self.cur_buf[0..self.cur_filled];
+                self.released[1] = bytes;
                 self.pending_len = 0;
             } else {
-                self.released[0] = self.cur_buf[0..self.cur_filled];
+                self.released[0] = bytes;
                 self.released[1] = &.{};
             }
-            self.cur_filled = 0;
         } else {
             // No merge: the just-pushed chunk is now the lone raw top. By
             // invariant, the previous pending must have been empty (a no-merge
             // push always follows a merge-bearing push or is the very first).
             std.debug.assert(self.pending_len == 0);
-            @memcpy(self.pending_buf[0..self.cur_filled], self.cur_buf[0..self.cur_filled]);
-            self.pending_len = self.cur_filled;
-            self.cur_filled = 0;
+            @memcpy(self.pending_buf[0..bytes.len], bytes);
+            self.pending_len = bytes.len;
         }
 
         self.chunk_counter += 1;
@@ -1442,24 +1437,24 @@ pub const Verifier = struct {
     /// flag on the final merge, comparing intermediate parents to the
     /// outboard and the root to `expected_root`. Release bytes (pending + last
     /// chunk) only after the root matches.
-    fn finaliseLastChunk(self: *Verifier) !void {
+    fn finaliseLastChunk(self: *Verifier, bytes: []u8) !void {
         const total_chunks = self.chunk_counter + 1;
 
         if (total_chunks == 1) {
             std.debug.assert(self.pending_len == 0);
             const cv = blake3.chunkHash(
-                self.cur_buf[0..self.cur_filled],
+                bytes,
                 0,
                 blake3.iv,
                 .{ .root = true },
             );
             const got = blake3.cvWordsToBytes(cv);
             if (!std.mem.eql(u8, &got, &self.expected_root)) return error.RootMismatch;
-            self.released[0] = self.cur_buf[0..self.cur_filled];
+            self.released[0] = bytes;
             self.released[1] = &.{};
         } else {
             var current = blake3.chunkHash(
-                self.cur_buf[0..self.cur_filled],
+                bytes,
                 self.chunk_counter,
                 blake3.iv,
                 .{},
@@ -1488,15 +1483,14 @@ pub const Verifier = struct {
             // Root verified — release pending (if any) then last chunk.
             if (self.pending_len > 0) {
                 self.released[0] = self.pending_buf[0..self.pending_len];
-                self.released[1] = self.cur_buf[0..self.cur_filled];
+                self.released[1] = bytes;
                 self.pending_len = 0;
             } else {
-                self.released[0] = self.cur_buf[0..self.cur_filled];
+                self.released[0] = bytes;
                 self.released[1] = &.{};
             }
         }
 
-        self.cur_filled = 0;
         self.done = true;
     }
 };
