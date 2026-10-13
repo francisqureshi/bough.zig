@@ -25,6 +25,8 @@ const blake3 = @import("blake3_lo.zig");
 const Bough = @This();
 
 pub const Hash = [blake3.digest_length]u8;
+/// Root-only resumable hashing over caller-owned chunk batches.
+pub const ContentHasher = @import("ContentHasher.zig");
 /// Bounded worker-thread encoding into a positional outboard file.
 pub const Parallel = @import("Parallel.zig");
 
@@ -2588,4 +2590,46 @@ test "Verifier handles empty file" {
     bogus[0] ^= 1;
     var v2 = Verifier.init(io, &ob, &content_reader, bogus);
     try testing.expectError(error.RootMismatch, v2.read(&dest));
+}
+
+test "resumable content hashing matches encoding across chunk and batch boundaries" {
+    const payload = try std.testing.allocator.alloc(u8, 33 * chunk_length + 1);
+    defer std.testing.allocator.free(payload);
+    var random = std.Random.DefaultPrng.init(123);
+    random.fill(payload);
+    for ([_]usize{ 0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33 }) |chunks| {
+        for ([_]usize{ chunks * chunk_length -| 1, chunks * chunk_length, chunks * chunk_length + 1 }) |size| {
+            var input: std.Io.Reader = .fixed(payload[0..size]);
+            var discard: std.Io.Writer.Discarding = .init(&.{});
+            const expected = try encodeReader(&input, size, &discard.writer);
+            for ([_]usize{ 1, 2, 3, 8, 11 }) |batch_chunks| {
+                var hasher: ContentHasher = .init(size);
+                var offset: usize = 0;
+                while (offset < size) {
+                    const len = @min(batch_chunks * chunk_length, size - offset);
+                    try hasher.update(payload[offset..][0..len]);
+                    // Moving the state between preparation and sending must not
+                    // retain pointers to either state or caller-owned bytes.
+                    const moved = hasher;
+                    hasher = moved;
+                    offset += len;
+                }
+                try std.testing.expectEqualSlices(u8, &expected.root, &try hasher.finish());
+            }
+        }
+    }
+}
+
+test "resumable content hashing rejects incomplete and invalid updates without consuming them" {
+    var bytes: [chunk_length + 1]u8 = @splat(9);
+    var hasher: ContentHasher = .init(chunk_length);
+    try std.testing.expectError(error.IncompleteContent, hasher.finish());
+    try std.testing.expectError(error.InvalidLength, hasher.update(&.{}));
+    try std.testing.expectError(error.InvalidLength, hasher.update(bytes[0..1]));
+    try std.testing.expectError(error.InvalidLength, hasher.update(&bytes));
+    try std.testing.expectEqual(0, hasher.consumed);
+    try hasher.update(bytes[0..chunk_length]);
+    const root = try hasher.finish();
+    try std.testing.expectError(error.InvalidLength, hasher.update(bytes[0..1]));
+    try std.testing.expectEqualSlices(u8, &root, &try hasher.finish());
 }
