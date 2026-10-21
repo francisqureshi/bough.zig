@@ -2066,7 +2066,7 @@ test "OutboardReader rejects maximum, truncated, and oversized layouts" {
     {
         var file = try tmp.dir.createFile(io, "content.bao", .{ .truncate = true });
         defer file.close(io);
-        var bytes = [_]u8{0} ** 9;
+        var bytes: [9]u8 = @splat(0);
         try file.writePositionalAll(io, &bytes, 0);
     }
     try std.testing.expectError(error.OutboardOversized, OutboardReader.open(io, tmp.dir, "content.bao"));
