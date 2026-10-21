@@ -20,7 +20,7 @@ const Work = struct {
     roots: [][8]u32,
     next: std.atomic.Value(usize) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
-    errors: [max_workers]?anyerror = [_]?anyerror{null} ** max_workers,
+    errors: [max_workers]?anyerror = @splat(null),
 };
 
 fn encodeSegment(work: *Work, k: usize) !void {
