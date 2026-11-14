@@ -1283,8 +1283,9 @@ pub const Verifier = struct {
     /// has been pushed onto the stack but not yet merged. By the popcount
     /// invariant there is at most one such chunk at a time, always at the
     /// stack top. `pending_len == 0` means no such chunk is currently
-    /// outstanding. Backed by `pending_buf`.
+    /// outstanding. Backed by `pending_buf` unless borrowed from this batch.
     pending_len: usize = 0,
+    pending_batch_offset: ?usize = null,
     pending_buf: [blake3.chunk_length]u8 = undefined,
 
     /// Released chunks queue (FIFO) of verified bytes ready to drain into
@@ -1363,6 +1364,7 @@ pub const Verifier = struct {
         std.debug.assert(self.released[0].len == 0 and self.released[1].len == 0);
         const chunk = blake3.chunk_length;
         if (self.batch_index == self.batch_count) {
+            std.debug.assert(self.pending_batch_offset == null);
             // Reserve the final chunk, even when full: ROOT handling is scalar.
             std.debug.assert(self.bytes_remaining > 0);
             const full_chunks = (self.bytes_remaining - 1) / chunk;
@@ -1435,9 +1437,13 @@ pub const Verifier = struct {
             // current chunk are now verified. Release pending first (older),
             // then current (newer), preserving file order.
             if (self.pending_len > 0) {
-                self.released[0] = self.pending_buf[0..self.pending_len];
+                self.released[0] = if (self.pending_batch_offset) |offset|
+                    self.batch_buf[offset..][0..self.pending_len]
+                else
+                    self.pending_buf[0..self.pending_len];
                 self.released[1] = bytes;
                 self.pending_len = 0;
+                self.pending_batch_offset = null;
             } else {
                 self.released[0] = bytes;
                 self.released[1] = &.{};
@@ -1447,7 +1453,15 @@ pub const Verifier = struct {
             // invariant, the previous pending must have been empty (a no-merge
             // push always follows a merge-bearing push or is the very first).
             std.debug.assert(self.pending_len == 0);
-            @memcpy(self.pending_buf[0..bytes.len], bytes);
+            // Borrow only when the next chunk is already in this batch.
+            // It verifies this pair, and read() drains both before any refill.
+            // Scalar tails still need owned storage across the next pump.
+            if (self.batch_index + 1 < self.batch_count) {
+                self.pending_batch_offset = self.batch_index * blake3.chunk_length;
+            } else {
+                @memcpy(self.pending_buf[0..bytes.len], bytes);
+                self.pending_batch_offset = null;
+            }
             self.pending_len = bytes.len;
         }
 
@@ -1504,9 +1518,13 @@ pub const Verifier = struct {
 
             // Root verified — release pending (if any) then last chunk.
             if (self.pending_len > 0) {
-                self.released[0] = self.pending_buf[0..self.pending_len];
+                self.released[0] = if (self.pending_batch_offset) |offset|
+                    self.batch_buf[offset..][0..self.pending_len]
+                else
+                    self.pending_buf[0..self.pending_len];
                 self.released[1] = bytes;
                 self.pending_len = 0;
+                self.pending_batch_offset = null;
             } else {
                 self.released[0] = bytes;
                 self.released[1] = &.{};
